@@ -118,15 +118,24 @@ This is only run once when weights are loaded
 flip(x) = @view x[end:-1:1, end:-1:1, :, :]
 
 """
-    maxpools1(x, kernel = 2)
-We need a max-pool with a fixed stride of 1. Required given assymetric padding
+    maxpools1!(bufs, x, kernel = 2)
+We need a max-pool with a fixed stride of 1. Required given asymmetric padding
 isn't supported by CuDNN
 """
-function maxpools1(x, kernel = 2)
+function maxpools1!(bufs, x, kernel = 2)
+    bufs[1][:, end, :, :] .= @view(x[:, end, :, :])
+    bufs[1][end, :, :, :] .= @view(x[end, :, :, :])
+    maxpool!(bufs[2], bufs[1], bufs[3])
+end
+"""
+    maxpools1_bufs(x, kernel = 2)
+Generate the buffers for maxpools1
+"""
+function maxpools1_bufs(x, kernel = 2)
     x = cat(x, x[:, end:end, :, :], dims = 2)
     x = cat(x, x[end:end, :, :, :], dims = 1)
     pdims = PoolDims(x, (kernel, kernel); stride = 1)
-    return maxpool(x, pdims)
+    return x, maxpool(x, pdims), pdims
 end
 
 """
@@ -210,9 +219,10 @@ mutable struct yolo <: AbstractModel
     chain::Array{Any, 1}                     # This holds chains of weights and functions
     W::Dict{Int64, T} where T <: DenseArray  # This holds arrays that the model writes to
     out::Array{Dict{Symbol, Any}, 1}         # This holds values and arrays needed for inference
+    bufs::Dict{Symbol,Any}                   # This holds buffers for layers
 
     # The constructor takes the official YOLO config files and weight files
-    yolo(cfgfile::String, weightfile::String, batchsize::Int = 1; silent::Bool = false, cfgchanges=nothing) = begin
+    function yolo(cfgfile::String, weightfile::String, batchsize::Int = 1; silent::Bool = false, cfgchanges=nothing)
         # read the config file and return [:layername => Dict(:setting => value), ...]
         # the first 'layer' is not a real layer, and has overarching YOLO settings
         cfgvec = cfgread(cfgfile)
@@ -234,6 +244,8 @@ mutable struct yolo <: AbstractModel
         cfg[:batchsize] = batchsize
         cfg[:output] = []
 
+        bufs = Dict{Symbol,Any}()
+
         # PART 1 - THE LAYERS
         #####################
         ch = [cfg[:channels]] # this keeps track of channels per layer for creating convolutions
@@ -248,8 +260,8 @@ mutable struct yolo <: AbstractModel
                 act     = ACT[block[:activation]]
                 bn      = haskey(block, :batch_normalize)
                 cw, cb, bb, bw, bm, bv = readweights(weightbytes, kern, ch[end], filters, bn)
-                push!(stack, gpu(Conv(cw, cb; stride = stride, pad = pad, dilation = 1)))
-                bn && push!(stack, gpu(BatchNorm(identity, bb, bw, bm, bv, 1f-5, 0.1f0, true, true, nothing, length(bb))))
+                push!(stack, Conv(cw, cb; stride = stride, pad = pad, dilation = 1))
+                bn && push!(stack, BatchNorm(identity, bb, bw, bm, bv, 1f-5, 0.1f0, true, true, nothing, length(bb)))
                 push!(stack, let; _act(x) = act.(x) end)
                 push!(fn, Chain(stack...))
                 push!(ch, filters)
@@ -268,10 +280,25 @@ mutable struct yolo <: AbstractModel
             elseif blocktype == :maxpool
                 siz = block[:size]
                 stride = block[:stride]
-                if stride==1 && CU_FUNCTIONAL[]
-                    push!(fn, let; _maxpools1(x) = maxpools1(x, siz) end) #Asymmetric padding not supported by CuDNN
+                if stride==1 && CU_FUNCTIONAL[] #Asymmetric padding not supported by CuDNN
+                    bufkey = gensym(blocktype)
+                    push!(fn, let; function _maxpools1(x)
+                            buf = get(bufs, bufkey) do
+                                maxpools1_buf(x, siz)
+                            end
+                            maxpools1!(buf, x, siz)
+                        end
+                    end)
                 else
-                    push!(fn, let; _maxpool(x) = maxpool(x, PoolDims(x, (siz, siz); stride = (stride, stride), padding = (0,2-stride,0,2-stride))) end)
+                    bufkey = gensym(blocktype)
+                    push!(fn, let; function _maxpool(x)
+                            buf, pdims = get(bufs, bufkey) do
+                                pdims = PoolDims(x, (siz, siz); stride = (stride, stride), padding = (0,2-stride,0,2-stride))
+                                maxpool(x, pdims), pdims
+                            end
+                            maxpool!(buf, x, pdims)
+                        end
+                    end)
                 end
                 push!(ch, ch[end])
                 !silent && prettyprint(["($(length(fn))) ","maxpool($siz,$stride)"," => "],[:blue,:magenta,:green])
@@ -413,7 +440,7 @@ mutable struct yolo <: AbstractModel
             out[i][:ignore] = get(cfg[:output][i], :ignore_thresh, 0.3) # for ignoring detections of same object (overlapping)
         end
 
-        return new(cfg, chainstack, W, out)
+        return new(cfg, chainstack, W, out, bufs)
     end
 end
 
